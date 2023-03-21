@@ -1,9 +1,8 @@
 import os.path
 import time
 import cv2
-import numpy as np
 import torch
-
+import numpy as np
 from yolox.data.datasets import COCO_CLASSES
 from yolox.exp import get_exp
 from demo import Predictor
@@ -83,53 +82,43 @@ def get_boxes(predictor, img):
                 continue
             man_boxes.append([int(n) for n in box])
 
-    return man_boxes, man_scores
+    return np.array(man_boxes), np.array(man_scores)
 
 
-def get_eulerAngles(rx, ry, rz):
+def eulerAnglesToRotationMatrix(theta, trans):
     import numpy as np
     import math
     import os
     os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 
-    r_vec = np.array([rx, ry, rz])
-    R, _ = cv2.Rodrigues(r_vec)
+    R_x = np.array([[1, 0, 0],
+                    [0, math.cos(theta[0]), -math.sin(theta[0])],
+                    [0, math.sin(theta[0]), math.cos(theta[0])]
+                    ])
 
-    def isRotationMatrix(R):
-        # 得到该矩阵的转置
-        Rt = np.transpose(R)
-        # 旋转矩阵的一个性质是，相乘后为单位阵
-        shouldBeIdentity = np.dot(Rt, R)
-        # 构建一个三维单位阵
-        I = np.identity(3, dtype=R.dtype)
-        # 将单位阵和旋转矩阵相乘后的值做差
-        n = np.linalg.norm(I - shouldBeIdentity)
-        # 如果小于一个极小值，则表示该矩阵为旋转矩阵
-        return n < 1e-6
-    assert (isRotationMatrix(R))
+    R_y = np.array([[math.cos(theta[1]), 0, math.sin(theta[1])],
+                    [0, 1, 0],
+                    [-math.sin(theta[1]), 0, math.cos(theta[1])]
+                    ])
 
-    sy = math.sqrt(R[0, 0] * R[0, 0] + R[1, 0] * R[1, 0])
+    R_z = np.array([[math.cos(theta[2]), -math.sin(theta[2]), 0],
+                    [math.sin(theta[2]), math.cos(theta[2]), 0],
+                    [0, 0, 1]
+                    ])
 
-    singular = sy < 1e-6
+    # 旋转矩阵
+    R = np.dot(R_z, np.dot(R_y, R_x))
 
-    if not singular:
-        x = math.atan2(R[2, 1], R[2, 2])
-        y = math.atan2(-R[2, 0], sy)
-        z = math.atan2(R[1, 0], R[0, 0])
-    else:
-        x = math.atan2(-R[1, 2], R[1, 1])
-        y = math.atan2(-R[2, 0], sy)
-        z = 0
+    # 测距俯仰角
+    Zw = np.array([0, 0, 1])
+    Zc = R @ Zw
+    pitch = math.acos(np.dot(Zw, Zc)) - math.pi / 2
 
-    a = np.array([0, 0, 1])
-    b = np.dot(R, a)
-    c = np.dot(a, b)
+    # 相机世界坐标
+    inverse_R = np.linalg.inv(R)
+    Pw0 = -inverse_R @ trans
 
-    _euler_angles = np.array([x, y, z])
-
-    print(f'Euler: {np.rad2deg(_euler_angles)}')
-
-    return _euler_angles
+    return R, pitch, Pw0
 
 
 def get_ground_coord(f, dx, dy, h, alpha, u0, v0, boxes):
@@ -147,9 +136,6 @@ def get_ground_coord(f, dx, dy, h, alpha, u0, v0, boxes):
     """
     import math
 
-    if len(boxes) == 0:
-        return
-
     ground_coord = []  # 目标所在地平面世界坐标集合
     for i in range(len(boxes)):
         box = boxes[i]
@@ -165,16 +151,64 @@ def get_ground_coord(f, dx, dy, h, alpha, u0, v0, boxes):
         beta = math.atan(hi * dy / f)
 
         # 计算落脚点地面坐标
-        # vh = f / dy * math.tan(alpha)
-        # y = 1 / (math.cos(alpha) ** 2) * f / dy * h / (hi + vh) - h * math.tan(alpha) if hi + vh >= 0 else -1
-        # x = wi * h / (hi + vh) * 1 / math.cos(alpha)
-
-        y = h / math.tan(alpha + beta) if v - v0 >= 0 else h / math.tan(alpha - beta)
+        y = (h / math.tan(alpha + beta)) if (v - v0 >= 0) else (h / math.tan(alpha - beta))
         x = wi * dx * math.sqrt(h ** 2 + y ** 2) / math.sqrt((hi * dy) ** 2 + f ** 2)
 
         ground_coord.append([x, y])
 
-    return ground_coord
+    return np.round(ground_coord)
+
+
+def rule_1meter(ground_coord):
+    import numpy as np
+
+    rules = []
+    for i in range(len(ground_coord)):
+        for j in range(len(ground_coord)):
+            if i != j:
+                dis = np.linalg.norm(ground_coord[i] - ground_coord[j])
+                if dis < 1000:
+                    rules.append(False)
+                    break
+        if len(rules) < i + 1:
+            rules.append(True)
+
+    return rules
+
+
+def visualize(img, boxes, show_dis=False, show_coord=False, activate_rule=False):
+    if show_dis and len(coord) > 0:
+        dis = np.linalg.norm(coord, axis=1)
+        for i in range(len(boxes)):
+            text = '{:.2f}m'.format(dis[i] / 1000)
+            font = cv2.FONT_HERSHEY_SIMPLEX
+            fontScale = 0.4
+            thickness = 1
+            size, baseLine = cv2.getTextSize(text, font, fontScale, thickness)
+            x, y = (boxes[i][0] + boxes[i][2]) / 2 - size[0] / 2, boxes[i][3] - baseLine
+            cv2.putText(img, text, (int(x), int(y)), font, fontScale, (255, 255, 255), thickness)
+
+    if show_coord:
+        for i in range(len(boxes)):
+            text = '({:.1f}, {:.1f})'.format(coord[i][0] / 1000, coord[i][1] / 1000)
+            font = cv2.FONT_HERSHEY_SIMPLEX
+            fontScale = 0.3
+            thickness = 1
+            size, baseLine = cv2.getTextSize(text, font, fontScale, thickness)
+            x, y = (boxes[i][0] + boxes[i][2]) / 2 - size[0] / 2, boxes[i][3] + size[1] + baseLine
+            cv2.putText(img, text, (int(x), int(y)), font, fontScale, (255, 255, 255), thickness)
+
+    if activate_rule:
+        # 计算坐标是否遵守一米距规则
+        rules = rule_1meter(coord)
+        # 过滤合规检测框
+        boxes = [boxes[n] for n in range(len(rules)) if not rules[n]]
+
+    for i in range(len(boxes)):
+        box = boxes[i]
+        cv2.rectangle(img, (box[0], box[1]), (box[2], box[3]), (33, 26, 213), 1)
+
+    return img
 
 
 if __name__ == "__main__":
@@ -183,10 +217,14 @@ if __name__ == "__main__":
     logging.basicConfig(format='%(levelname)s:%(message)s', level=logging.DEBUG)
 
     # 读取视频
-    cap = cv2.VideoCapture('../assets/terrace1-c2.avi')
+    cap = cv2.VideoCapture('../assets/terrace1-c0.avi')
 
     fps_start_time = time.time()  # 开始计时
     fps = 0  # 初始化帧数计数器
+
+    # 旋转矩阵，俯仰角，相机世界坐标
+    R, pitch, Pw0 = eulerAnglesToRotationMatrix([1.9007833770e+00, 4.9730769727e-01, 1.8415452559e-01],
+                                                np.array([-4.8441913843e+03, 5.5109448682e+02, 4.9667438357e+03]))
 
     # 生成预测器
     predictor = create_predictor(exp_name='yolox-s', conf=0.4, nms=0.6, device='gpu')
@@ -200,24 +238,15 @@ if __name__ == "__main__":
 
         # 获取人检测框与置信度集合
         boxes, scores = get_boxes(predictor, frame)
-        cls_ids = [0 for n in range(len(boxes))]
-
-        # 绘制检测框
-        frame = vis(img=frame, boxes=boxes, scores=scores,
-                    cls_ids=cls_ids, conf=predictor.confthre, class_names=predictor.cls_names)
-
-        euler_angles = get_eulerAngles(-1.83, 0.377, 3.02)
+        # 过滤分数低于置信度的检测框
+        boxes = [boxes[n] for n in range(len(boxes)) if scores[n] >= predictor.confthre]
 
         # 计算目标世界坐标集合
-        coord = get_ground_coord(f=19.9, dx=0.023, dy=0.023, h=2000, alpha=0.25,
-                                 u0=355 / 2, v0=241 / 2, boxes=boxes)
+        coord = get_ground_coord(f=20.17, dx=0.023, dy=0.023, h=2045, alpha=pitch,
+                                 u0=366 / 2, v0=305 / 2, boxes=boxes)
 
-        import math
-
-        # 添加坐标文本
-        for i in range(len(boxes)):
-            cv2.putText(frame, '({:.1f} , {:.1f})'.format(coord[i][0] / 1000, coord[i][1] / 1000),
-                        (boxes[i][0], boxes[i][3]), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 255), 1)
+        # 绘制检测框
+        frame = visualize(img=frame, boxes=boxes, show_dis=True, show_coord=True, activate_rule=True)
 
         fps_end_time = time.time()  # 获取当前时间戳
         time_diff = fps_end_time - fps_start_time  # 计算时间差
@@ -225,7 +254,7 @@ if __name__ == "__main__":
             fps = int(1 / time_diff)  # 计算FPS
 
         # 在视频帧上添加FPS文本
-        cv2.putText(frame, 'FPS: ' + str(fps), (5, 15), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
+        cv2.putText(frame, 'FPS: ' + str(fps), (0, 10), cv2.FONT_HERSHEY_SIMPLEX, 0.3, (0, 0, 255), 1)
         # 缩放图像
         resized_img = cv2.resize(frame, (frame.shape[1] * 2, frame.shape[0] * 2))
         # 显示图像
