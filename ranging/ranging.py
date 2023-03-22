@@ -6,7 +6,6 @@ import numpy as np
 from yolox.data.datasets import COCO_CLASSES
 from yolox.exp import get_exp
 from demo import Predictor
-from yolox.utils import vis
 
 
 def create_predictor(exp_name, conf, nms, tsize=640, device='cpu'):
@@ -227,7 +226,7 @@ if __name__ == "__main__":
                                                 np.array([-4.8441913843e+03, 5.5109448682e+02, 4.9667438357e+03]))
 
     # 生成预测器
-    predictor = create_predictor(exp_name='yolox-s', conf=0.4, nms=0.6, device='gpu')
+    predictor = create_predictor(exp_name='yolox-s', conf=0.5, nms=0.4, device='gpu')
 
     while True:
         # 读取一帧图像
